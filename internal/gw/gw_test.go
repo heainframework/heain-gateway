@@ -130,6 +130,10 @@ func setup(t *testing.T) *env {
 		b, _ := io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Set-Cookie", "evil=1")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Server-Timing", "leak")
 		_ = json.NewEncoder(w).Encode(map[string]any{"path": r.URL.Path, "query": r.URL.RawQuery, "user": r.Header.Get(heain.HeaderUser),
 			"lane": r.Header.Get(heain.HeaderLane), "trace": r.Header.Get(heain.HeaderTrace), "body": string(b), "cookie": r.Header.Get("Cookie")})
 	}))
@@ -538,5 +542,19 @@ func TestMatch(t *testing.T) {
 		if cleanPath(p) != ok {
 			t.Errorf("clean %s", p)
 		}
+	}
+}
+
+func TestPagePolicyHeaders(t *testing.T) {
+	e := setup(t)
+	resp, err := e.srv.Client().Get(e.srv.URL + "/api/demo/v1/hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	h := resp.Header
+	if resp.StatusCode != 200 || h.Get("Content-Security-Policy") != "default-src 'self'" || h.Get("X-Frame-Options") != "DENY" ||
+		h.Get("Referrer-Policy") != "no-referrer" || h.Get("Set-Cookie") != "" || h.Get("Server-Timing") != "" {
+		t.Fatalf("headers: %d %v", resp.StatusCode, h)
 	}
 }

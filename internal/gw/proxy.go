@@ -113,7 +113,9 @@ func cleanPath(p string) bool {
 
 var passReq = []string{"Content-Type", "Accept", "Accept-Language", "If-None-Match", "If-Modified-Since", "Range"}
 var passResp = []string{"Content-Type", "Content-Length", "Content-Disposition", "Content-Range", "Accept-Ranges", "Cache-Control",
-	"ETag", "Last-Modified", "Retry-After", "X-Heain-Trace"}
+	"ETag", "Last-Modified", "Retry-After", "X-Heain-Trace",
+	// an app serving pages (heain-console, Step 5b) sets its own page policy
+	"Content-Security-Policy", "X-Frame-Options", "Referrer-Policy"}
 
 // proxy: <METHOD> /api/{app}/<path> -> the app instance serving the route.
 func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request) {

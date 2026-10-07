@@ -50,6 +50,7 @@ Built on [heain-sdk](https://github.com/heainframework/heain-sdk) v1 (Step 4.6a-
   - the lane;
   - for a signed-in person, an `X-Heain-User` assertion signed with the gateway's app key, for that app, method, path and trace.
 - Only a few headers pass in either direction. Cookies, `Authorization` and any `X-Heain-*` header a client sends are never passed on.
+- An app that serves pages (heain-console, Step 5b) sets its own `Content-Security-Policy`, `X-Frame-Options` and `Referrer-Policy`; those pass back to the browser.
 - Every request is audited (`gateway.proxy`, with the person, route, instance and status).
 
 **Admin (`/admin/...`, role `gateway-admin`)**
