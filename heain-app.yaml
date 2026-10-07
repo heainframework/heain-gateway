@@ -1,0 +1,29 @@
+# heain-gateway v1 (Step 4.6a, 2026-10-07): the way in for people (web and mobile).
+# Built-in accounts (password + TOTP; credentials sealed here under keys in heain-core's KMS, the
+# account record in heain-database) and OIDC providers; web sessions (cookie + CSRF) and mobile
+# tokens (access + rotating refresh); /api/{app}/<path> reaches only the endpoints apps declare
+# public and heain-core's gateway.exposures exposes (P5), checked against the route's roles and
+# rate, called over mTLS with a signed user assertion (heain-sdk), every request audited.
+# heain-core must list this app in gateway.apps.
+manifest_version: 1
+app:
+  id: heain-gateway
+  version: 1.0.0
+  group: base
+  description: Ingress for people -- sign-in (accounts + TOTP, OIDC), sessions, and exposed app routes with roles, rate limits and signed user assertions.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - {name: gateway.auth, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [credential, session]}
+  - {name: gateway.proxy, version: 1, formal: true, execution: direct, ai: {used: false}}
+endpoints:
+  - {method: POST, path: /v1/gateway/sessions/revoke, capability: gateway.auth, formal: true}
+  - {method: GET, path: /v1/gateway/routes, capability: gateway.proxy, formal: false}
+uses:
+  - {app: heain-database, capabilities: [db.account.read, db.account.write]}
+data_classes:
+  - {name: credential, sovereignty: node-local, encrypted_at_rest: true, crypto_shred: true}
+  - {name: session, sovereignty: node-local, encrypted_at_rest: true, retention: {max: 30d}}
+offline:
+  allowed: [gateway.auth, gateway.proxy]
+  journal: none

@@ -1,0 +1,19 @@
+# gateway-demo: an example app for heain-gateway (and its live test). It declares which of its
+# endpoints people may reach (public: true) and answers with the person heain-sdk verified.
+manifest_version: 1
+app:
+  id: gateway-demo
+  version: 1.0.0
+  group: domain
+  description: Example app behind heain-gateway -- echoes the signed-in person.
+  api: v1
+  sdk: {name: heain-sdk-go, version: ">=1.0.0"}
+capabilities:
+  - {name: demo.items, version: 1, formal: true, execution: direct, lane: records, ai: {used: false}}
+  - {name: demo.hello, version: 1, formal: false, execution: direct, ai: {used: false}}
+endpoints:
+  - {method: GET, path: "/v1/items/{id}", capability: demo.items, formal: true, public: true}
+  - {method: POST, path: /v1/items, capability: demo.items, formal: true, public: true}
+  - {method: DELETE, path: "/v1/items/{id}", capability: demo.items, formal: true, public: true}
+  - {method: GET, path: /v1/internal, capability: demo.items, formal: true}
+  - {method: GET, path: /v1/hello, capability: demo.hello, formal: false, public: true}

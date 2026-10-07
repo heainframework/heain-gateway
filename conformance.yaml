@@ -1,0 +1,12 @@
+# heain-gateway under the heain conformance suite (heain-sdk conformance/). The suite checks the app
+# plane (mTLS, for other apps); people's side is exercised by scripts/live_4_6a.sh. A throwaway
+# self-signed certificate (TEST ONLY) stands in for the public one; heain-database runs alongside as
+# a companion (account records live there).
+manifest: heain-app.yaml
+build: [go, build, -o, heain-gateway, ./cmd/heain-gateway]
+start: [./heain-gateway, -test-self-signed, -public-listen, "127.0.0.1:0"]
+port: 19500
+companions: [../heain-database]
+endpoints:
+  - {method: GET, path: /v1/gateway/routes, expect: 200}
+  - {method: POST, path: /v1/gateway/sessions/revoke, body: {user: conformance-secret-user}, expect: 200, secret: conformance-secret-user}
