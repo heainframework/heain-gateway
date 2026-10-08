@@ -114,7 +114,7 @@ func (g *Gateway) oidcCallback(w http.ResponseWriter, r *http.Request) {
 	tok := secret.Token(32)
 	ss := sessionFor(acc, "oidc:"+p.Name, "web", now, g.Cfg.SessionTTL, g.clientAddr(r))
 	ss.Hash, ss.CSRF = secret.SHA256(tok), secret.Token(24)
-	if err := g.Store.PutSession(ss); err != nil {
+	if err := g.Store.CreateSession(ss); err != nil {
 		fail(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}

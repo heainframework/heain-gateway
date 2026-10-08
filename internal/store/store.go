@@ -9,6 +9,12 @@
 //
 // Who an account is and its roles live in heain-database (author decision
 // 2026-10-07); this store holds only what proves a login.
+//
+// Stage B-1c (author decisions 2026-10-08): with zone sync, the inside key
+// and the per-account keys are zone keys, so every gateway of the zone
+// holds the same sealed records; every write is told to OnWrite (the change
+// log) and records from other gateways come in through ApplyRaw, as they
+// are, never opened.
 package store
 
 import (
@@ -19,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/heainframework/heain-sdk/heain"
@@ -46,6 +53,79 @@ type Store struct {
 	inside *heain.Sealer
 	ixKey  []byte
 	keys   Keys
+	// OnWrite, when set, is told every write after it is stored: the store
+	// (credential, session, user_session), the key and the sealed value
+	// (nil = deleted).
+	OnWrite func(store, key string, sealed []byte)
+}
+
+// Replicated stores and their buckets.
+var replicated = map[string][]byte{"credential": bCreds, "session": bSessions, "user_session": bUserSess}
+
+type write struct {
+	store, key string
+	val        []byte
+}
+
+// put and del write in tx and remember the write for OnWrite.
+func put(tx *bolt.Tx, store, key string, val []byte, ws *[]write) error {
+	*ws = append(*ws, write{store, key, val})
+	return tx.Bucket(replicated[store]).Put([]byte(key), val)
+}
+
+func del(tx *bolt.Tx, store, key string, ws *[]write) error {
+	*ws = append(*ws, write{store, key, nil})
+	return tx.Bucket(replicated[store]).Delete([]byte(key))
+}
+
+// update runs f in a write transaction and tells OnWrite what it wrote.
+func (s *Store) update(f func(tx *bolt.Tx, ws *[]write) error) error {
+	var ws []write
+	if err := s.db.Update(func(tx *bolt.Tx) error { ws = ws[:0]; return f(tx, &ws) }); err != nil {
+		return err
+	}
+	if s.OnWrite != nil {
+		for _, w := range ws {
+			s.OnWrite(w.store, w.key, w.val)
+		}
+	}
+	return nil
+}
+
+// Target is one replicated store, for the change log.
+type Target struct {
+	s     *Store
+	store string
+}
+
+// Target returns the replicated store name.
+func (s *Store) Target(store string) Target { return Target{s: s, store: store} }
+
+// ApplyRaw stores a sealed value from another gateway as it is (nil = delete).
+func (t Target) ApplyRaw(key string, sealed []byte) error {
+	b := replicated[t.store]
+	if b == nil {
+		return fmt.Errorf("store: unknown replicated store %q", t.store)
+	}
+	return t.s.db.Update(func(tx *bolt.Tx) error {
+		if sealed == nil {
+			return tx.Bucket(b).Delete([]byte(key))
+		}
+		return tx.Bucket(b).Put([]byte(key), sealed)
+	})
+}
+
+// All returns every record of a replicated store (to log them once when
+// zone sync starts).
+func (s *Store) All(store string) (map[string][]byte, error) {
+	out := map[string][]byte{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(replicated[store]).ForEach(func(k, v []byte) error {
+			out[string(k)] = append([]byte(nil), v...)
+			return nil
+		})
+	})
+	return out, err
 }
 
 // Open opens (creating) the store at path; inside is the app's inside key.
@@ -105,8 +185,20 @@ type credEnvelope struct {
 
 func (s *Store) credKeyName(ix string) string { return "cred-" + ix[:24] }
 
-// PutCredential stores c (sealed under the account's own key).
+// CreateCredential stores c, making or replacing it (sealed under the
+// account's own key).
+func (s *Store) CreateCredential(ctx context.Context, c Credential) error {
+	return s.putCredential(ctx, c, true)
+}
+
+// PutCredential updates an existing credential; ErrNotFound when it was
+// removed meanwhile (also by another gateway of the zone), so an update
+// never brings a removed account back.
 func (s *Store) PutCredential(ctx context.Context, c Credential) error {
+	return s.putCredential(ctx, c, false)
+}
+
+func (s *Store) putCredential(ctx context.Context, c Credential, create bool) error {
 	ix := s.Index(c.User)
 	kn := s.credKeyName(ix)
 	ks, err := s.keys.Sealer(ctx, kn)
@@ -115,8 +207,11 @@ func (s *Store) PutCredential(ctx context.Context, c Credential) error {
 	}
 	raw, _ := json.Marshal(c)
 	env, _ := json.Marshal(credEnvelope{Key: kn, Sealed: ks.Seal(raw, []byte("cred/"+ix))})
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bCreds).Put([]byte(ix), s.inside.Seal(env, []byte("credenv/"+ix)))
+	return s.update(func(tx *bolt.Tx, ws *[]write) error {
+		if !create && tx.Bucket(bCreds).Get([]byte(ix)) == nil {
+			return ErrNotFound
+		}
+		return put(tx, "credential", ix, s.inside.Seal(env, []byte("credenv/"+ix)), ws)
 	})
 }
 
@@ -166,7 +261,7 @@ func (s *Store) DeleteCredential(ctx context.Context, user string) error {
 	if err := s.keys.Destroy(ctx, s.credKeyName(ix)); err != nil {
 		return fmt.Errorf("destroying the credential key: %w", err)
 	}
-	return s.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(bCreds).Delete([]byte(ix)) })
+	return s.update(func(tx *bolt.Tx, ws *[]write) error { return del(tx, "credential", ix, ws) })
 }
 
 // Session is a signed-in person's session.
@@ -187,17 +282,30 @@ type Session struct {
 	ClientAddr string    `json:"client_addr,omitempty"` // where it was created
 }
 
-func (s *Store) putSession(tx *bolt.Tx, ss Session) error {
+func (s *Store) putSession(tx *bolt.Tx, ss Session, ws *[]write) error {
 	raw, _ := json.Marshal(ss)
-	if err := tx.Bucket(bSessions).Put([]byte(ss.Hash), s.inside.Seal(raw, []byte("session/"+ss.Hash))); err != nil {
+	if err := put(tx, "session", ss.Hash, s.inside.Seal(raw, []byte("session/"+ss.Hash)), ws); err != nil {
 		return err
 	}
-	return tx.Bucket(bUserSess).Put([]byte(s.Index(ss.User)+"/"+ss.Hash), []byte{})
+	// the value is a marker, never empty: an empty value would travel as a delete
+	return put(tx, "user_session", s.Index(ss.User)+"/"+ss.Hash, []byte{1}, ws)
 }
 
-// PutSession stores ss under its token hash.
+// CreateSession stores a new session under its token hash.
+func (s *Store) CreateSession(ss Session) error {
+	return s.update(func(tx *bolt.Tx, ws *[]write) error { return s.putSession(tx, ss, ws) })
+}
+
+// PutSession updates an existing session; ErrNotFound when it was ended
+// meanwhile (also on another gateway of the zone), so an update never
+// brings a revoked session back.
 func (s *Store) PutSession(ss Session) error {
-	return s.db.Update(func(tx *bolt.Tx) error { return s.putSession(tx, ss) })
+	return s.update(func(tx *bolt.Tx, ws *[]write) error {
+		if tx.Bucket(bSessions).Get([]byte(ss.Hash)) == nil {
+			return ErrNotFound
+		}
+		return s.putSession(tx, ss, ws)
+	})
 }
 
 // Session finds a session by token hash.
@@ -226,26 +334,29 @@ func (s *Store) Session(hash string) (Session, error) {
 
 // Replace swaps session old for nw atomically (mobile refresh rotation).
 func (s *Store) Replace(old string, nw Session) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		ss, err := s.Session(old)
-		if err == nil {
-			_ = tx.Bucket(bUserSess).Delete([]byte(s.Index(ss.User) + "/" + old))
+	prev, perr := s.Session(old)
+	return s.update(func(tx *bolt.Tx, ws *[]write) error {
+		if tx.Bucket(bSessions).Get([]byte(old)) == nil {
+			return ErrNotFound // ended meanwhile: no rotation
 		}
-		if err := tx.Bucket(bSessions).Delete([]byte(old)); err != nil {
+		if perr == nil {
+			_ = del(tx, "user_session", s.Index(prev.User)+"/"+old, ws)
+		}
+		if err := del(tx, "session", old, ws); err != nil {
 			return err
 		}
-		return s.putSession(tx, nw)
+		return s.putSession(tx, nw, ws)
 	})
 }
 
 // DeleteSession removes one session.
 func (s *Store) DeleteSession(hash string) error {
 	ss, _ := s.Session(hash)
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx, ws *[]write) error {
 		if ss.User != "" {
-			_ = tx.Bucket(bUserSess).Delete([]byte(s.Index(ss.User) + "/" + hash))
+			_ = del(tx, "user_session", s.Index(ss.User)+"/"+hash, ws)
 		}
-		return tx.Bucket(bSessions).Delete([]byte(hash))
+		return del(tx, "session", hash, ws)
 	})
 }
 
@@ -253,7 +364,8 @@ func (s *Store) DeleteSession(hash string) error {
 func (s *Store) RevokeUser(user string) (int, error) {
 	pfx := []byte(s.Index(user) + "/")
 	n := 0
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx, ws *[]write) error {
+		n = 0
 		c := tx.Bucket(bUserSess).Cursor()
 		var keys [][]byte
 		for k, _ := c.Seek(pfx); k != nil && len(k) >= len(pfx) && string(k[:len(pfx)]) == string(pfx); k, _ = c.Next() {
@@ -264,8 +376,8 @@ func (s *Store) RevokeUser(user string) (int, error) {
 			if tx.Bucket(bSessions).Get(h) != nil {
 				n++
 			}
-			_ = tx.Bucket(bSessions).Delete(h)
-			_ = tx.Bucket(bUserSess).Delete(k)
+			_ = del(tx, "session", string(h), ws)
+			_ = del(tx, "user_session", string(k), ws)
 		}
 		return nil
 	})
@@ -289,4 +401,80 @@ func (s *Store) Sweep(now time.Time) int {
 		_ = s.DeleteSession(h)
 	}
 	return len(dead)
+}
+
+// Migrate seals the credentials kept under this node's keys (before zone
+// sync) again under the zone keys of this store: the envelope under the new
+// inside key, each credential under its account's zone key, filed under the
+// new index; the old per-account node key is destroyed. Sessions sealed
+// under the old key are dropped (people sign in again). It returns how many
+// credentials moved and how many sessions were dropped.
+func (s *Store) Migrate(ctx context.Context, oldInside []byte, old Keys) (moved, dropped int, err error) {
+	olds, err := heain.NewSealer(oldInside)
+	if err != nil {
+		return 0, 0, err
+	}
+	all, err := s.All("credential")
+	if err != nil {
+		return 0, 0, err
+	}
+	for ix, v := range all {
+		if _, err := s.inside.Open(v, []byte("credenv/"+ix)); err == nil {
+			continue // already under the zone key
+		}
+		envRaw, err := olds.Open(v, []byte("credenv/"+ix))
+		if err != nil {
+			continue // neither key opens it: left as it is
+		}
+		var env credEnvelope
+		if err := json.Unmarshal(envRaw, &env); err != nil {
+			return moved, dropped, err
+		}
+		ks, err := old.Sealer(ctx, env.Key)
+		if err != nil {
+			return moved, dropped, fmt.Errorf("old credential key: %w", err)
+		}
+		raw, err := ks.Open(env.Sealed, []byte("cred/"+ix))
+		if err != nil {
+			return moved, dropped, err
+		}
+		var c Credential
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return moved, dropped, err
+		}
+		if err := s.CreateCredential(ctx, c); err != nil {
+			return moved, dropped, err
+		}
+		if nix := s.Index(c.User); nix != ix {
+			if err := s.update(func(tx *bolt.Tx, ws *[]write) error { return del(tx, "credential", ix, ws) }); err != nil {
+				return moved, dropped, err
+			}
+		}
+		_ = old.Destroy(ctx, env.Key)
+		moved++
+	}
+	sess, _ := s.All("session")
+	us, _ := s.All("user_session")
+	err = s.update(func(tx *bolt.Tx, ws *[]write) error {
+		gone := map[string]bool{}
+		for h, v := range sess {
+			if _, err := s.inside.Open(v, []byte("session/"+h)); err == nil {
+				continue
+			}
+			gone[h] = true
+			if err := del(tx, "session", h, ws); err != nil {
+				return err
+			}
+			dropped++
+		}
+		for k := range us {
+			if i := strings.LastIndex(k, "/"); i > 0 && (gone[k[i+1:]] || tx.Bucket(bSessions).Get([]byte(k[i+1:])) == nil) {
+				if err := del(tx, "user_session", k, ws); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	return moved, dropped, err
 }

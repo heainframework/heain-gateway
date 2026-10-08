@@ -31,6 +31,7 @@ import (
 	"github.com/heainframework/heain-gateway/internal/oidc"
 	"github.com/heainframework/heain-gateway/internal/store"
 	"github.com/heainframework/heain-sdk/heain"
+	"github.com/heainframework/heain-sdk/zonesync"
 )
 
 func env(k, def string) string {
@@ -86,6 +87,8 @@ func main() {
 	routesEvery := flag.Duration("routes-refresh", 5*time.Second, "how often the routes are read from core")
 	selfSigned := flag.Bool("test-self-signed", false, "TEST ONLY: without -public-cert, serve people with a throwaway self-signed certificate (127.0.0.1, localhost)")
 	issuer := flag.String("totp-issuer", env("HEAIN_GATEWAY_TOTP_ISSUER", "heain"), "the name authenticator apps show")
+	zoneSync := flag.Bool("zone-sync", env("HEAIN_GATEWAY_ZONE_SYNC", "on") != "off", "share credentials and sessions with the other gateways of the zone, sealed under zone keys (env HEAIN_GATEWAY_ZONE_SYNC=off to keep them on this instance only)")
+	zoneEvery := flag.Duration("zone-sync-every", 2*time.Second, "how often the other gateways of the zone are read (a revocation is pushed at once)")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -125,8 +128,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("heain-gateway: data key from core: %v", err)
 	}
-	st, err := store.Open(filepath.Join(state, "gateway.db"), inside, store.Keys{Sealer: app.Sealer, Destroy: app.DestroyDataKey})
-	if err != nil {
+	var st *store.Store
+	var zs *zoneSyncer
+	if *zoneSync {
+		// Stage B-1c: credentials and sessions under zone keys, shared by the
+		// gateways of the zone (author decisions 2026-10-08).
+		zk, err := zoneKey(ctx, app, "gateway")
+		if err != nil {
+			log.Fatalf("heain-gateway: zone key from core: %v", err)
+		}
+		if st, err = store.Open(filepath.Join(state, "gateway.db"), zk, store.Keys{Sealer: app.ZoneSealer, Destroy: app.DestroyZoneKey}); err != nil {
+			log.Fatal(err)
+		}
+		if zs, err = startZoneSync(ctx, app, st, state, inside); err != nil {
+			log.Fatal(err)
+		}
+		defer zs.log.Close()
+	} else if st, err = store.Open(filepath.Join(state, "gateway.db"), inside, store.Keys{Sealer: app.Sealer, Destroy: app.DestroyDataKey}); err != nil {
 		log.Fatal(err)
 	}
 	defer st.Close()
@@ -151,6 +169,12 @@ func main() {
 		Cfg: gw.Config{SessionTTL: *sessionTTL, IdleTTL: *idleTTL, AccessTTL: *accessTTL, DefaultRate: *rate, LoginRate: *loginRate,
 			MaxBody: *maxBody, UpstreamTO: *upstream, TrustForwarded: *trustFwd, Issuer: *issuer}})
 
+	if zs != nil {
+		// another gateway of the zone may already hold the accounts
+		if n, _, err := zs.puller.Once(ctx); err == nil && n > 0 {
+			log.Printf("heain-gateway: zone sync: %d record(s) from the other gateways of the zone", n)
+		}
+	}
 	if *bootstrap != "" && !st.HasCredentials() {
 		if !gw.UserRe.MatchString(*bootstrap) {
 			log.Fatalf("heain-gateway: -bootstrap-admin %q is not an account name", *bootstrap)
@@ -208,6 +232,23 @@ func main() {
 		log.Printf("heain-gateway: %s ended %d session(s) of %s", heain.Caller(r.Context()), n, q.User)
 		_ = json.NewEncoder(w).Encode(map[string]any{"user": q.User, "sessions_ended": n})
 	}))
+	if zs != nil {
+		must(srv.HandleFunc("GET /v1/gateway/replica/changes", zonesync.Handler(app, zs.log)))
+		must(srv.HandleFunc("POST /v1/gateway/replica/poke", zs.puller.PokeHandler()))
+		go zs.run(ctx, *zoneEvery)
+	} else {
+		off := func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			code, msg := http.StatusServiceUnavailable, "zone sync is off on this instance"
+			if !zonesync.SameApp(app, r) {
+				code, msg = http.StatusForbidden, "only another heain-gateway may ask"
+			}
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"code": "zone_sync_off", "message": msg}})
+		}
+		must(srv.HandleFunc("GET /v1/gateway/replica/changes", off))
+		must(srv.HandleFunc("POST /v1/gateway/replica/poke", off))
+	}
 	al, err := net.Listen("tcp", heain.Listen(":19500"))
 	if err != nil {
 		log.Fatal(err)

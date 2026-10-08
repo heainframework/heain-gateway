@@ -107,7 +107,7 @@ func (g *Gateway) CreateLocal(ctx context.Context, id, name string, roles []stri
 	if err := g.Dir.Put(ctx, Account{ID: id, Name: name, Roles: roles, Source: "local"}); err != nil {
 		return "", err
 	}
-	if err := g.Store.PutCredential(ctx, store.Credential{User: id, PasswordH: h, MustChange: mustChange, Created: now, Changed: now}); err != nil {
+	if err := g.Store.CreateCredential(ctx, store.Credential{User: id, PasswordH: h, MustChange: mustChange, Created: now, Changed: now}); err != nil {
 		return "", err
 	}
 	return temp, nil

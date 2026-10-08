@@ -140,7 +140,10 @@ func (g *Gateway) login(w http.ResponseWriter, r *http.Request) {
 		g.authAudit(r, "password_changed", map[string]any{"user": user})
 	}
 	c.Failures, c.LockedUntil = 0, time.Time{}
-	if err := g.Store.PutCredential(ctx, c); err != nil {
+	if err := g.Store.PutCredential(ctx, c); errors.Is(err, store.ErrNotFound) {
+		bad("unknown_user") // removed meanwhile (on another gateway of the zone)
+		return
+	} else if err != nil {
 		fail(w, http.StatusServiceUnavailable, "unavailable", "credential store: "+err.Error())
 		return
 	}
@@ -265,7 +268,7 @@ func (g *Gateway) changePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	// every other session of the person ends
 	n, _ := g.Store.RevokeUser(p.S.User)
-	_ = g.Store.PutSession(p.S)
+	_ = g.Store.CreateSession(p.S) // this session stays
 	g.authAudit(r, "password_changed", map[string]any{"user": p.S.User, "other_sessions_ended": n - 1})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "changed"})
 }

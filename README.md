@@ -115,3 +115,17 @@ if u == nil || !u.HasRole("clerk") { ... }
 - WebAuthn;
 - ACME certificates;
 - a session shared between several gateway instances (sessions are per instance).
+
+## Stage B-1c: credentials and sessions shared by the gateways of a zone (1.1, 2026-10-08)
+
+The author decided (2026-10-08) that gateway sessions use the same sync as heain-database, and that credentials sync too, so a person signs in at any gateway of the zone. This replaces "a session shared between several gateway instances" in "Not yet" above.
+
+- **Zone keys.** The inside key is the zone key `gateway`, and each built-in account's credential key is the zone key `cred-<index>` (heain-sdk `App.ZoneKey`). Data classes `credential` and `session` are now `zone-local`. Removing an account destroys its zone key, so no gateway of the zone can open its credential afterwards.
+- **Change logs.** Every write goes to `<state>/replica.db`; each gateway pulls the others' logs (`GET /v1/gateway/replica/changes`, capability `gateway.replica`, heain-sdk `zonesync`) every `-zone-sync-every` (2 s). Records are copied sealed. Only another heain-gateway may read a log. Replaced changes are compacted every hour.
+- **Revocation at once.** Any ended session or removed credential makes this gateway ask the others to pull now (`POST /v1/gateway/replica/poke`), so a sign-out or an app's revocation ends the session on every gateway within about a second.
+- **Nothing comes back.** An update (lockout counter, password change, last-seen time, a refresh rotation) only changes a record that still exists here, so a removed account or an ended session is never written back by a gateway that read it a moment before.
+- **Start.** A gateway pulls the others' records before it would make a bootstrap admin, so a second gateway does not make a second one. On the first start with zone sync, credentials under the node keys are sealed again under zone keys (the old per-account keys are destroyed); sessions under the old key end (people sign in again). `-zone-sync=false` (`HEAIN_GATEWAY_ZONE_SYNC=off`) keeps everything on this instance.
+- **Cut off.** A gateway cut off from its Master keeps signing people in with its copies; what it changed meanwhile reaches the others when it is back.
+- **Known limits:** two gateways cut off from each other keep the later write of one record (last writer wins); a lockout counter can count a little low across gateways.
+
+Tests: `scripts/live_b1c.sh` (two gateways, one on a Master and one on its farm Worker).

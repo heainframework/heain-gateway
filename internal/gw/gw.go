@@ -317,7 +317,7 @@ func (g *Gateway) newSession(w http.ResponseWriter, r *http.Request, acc Account
 		g.setSessionCookies(w, tok, ss)
 		out["csrf_token"] = ss.CSRF
 	}
-	if err := g.Store.PutSession(ss); err != nil {
+	if err := g.Store.CreateSession(ss); err != nil {
 		fail(w, http.StatusInternalServerError, "internal", "session store: "+err.Error())
 		return ss
 	}

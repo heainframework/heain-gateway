@@ -5,10 +5,12 @@
 # public and heain-core's gateway.exposures exposes (P5), checked against the route's roles and
 # rate, called over mTLS with a signed user assertion (heain-sdk), every request audited.
 # heain-core must list this app in gateway.apps.
+# 1.1 (Stage B-1c, 2026-10-08): credentials and sessions are shared by the gateways of the zone
+# (zone-local, sealed under zone keys, gateway.replica; a revocation is pushed at once).
 manifest_version: 1
 app:
   id: heain-gateway
-  version: 1.0.0
+  version: 1.1.0
   group: base
   description: Ingress for people -- sign-in (accounts + TOTP, OIDC), sessions, and exposed app routes with roles, rate limits and signed user assertions.
   api: v1
@@ -16,14 +18,18 @@ app:
 capabilities:
   - {name: gateway.auth, version: 1, formal: true, execution: direct, ai: {used: false}, data_classes: [credential, session]}
   - {name: gateway.proxy, version: 1, formal: true, execution: direct, ai: {used: false}}
+  - {name: gateway.replica, version: 1, formal: false, execution: direct, ai: {used: false}, data_classes: [credential, session]}
 endpoints:
   - {method: POST, path: /v1/gateway/sessions/revoke, capability: gateway.auth, formal: true}
   - {method: GET, path: /v1/gateway/routes, capability: gateway.proxy, formal: false}
+  - {method: GET, path: /v1/gateway/replica/changes, capability: gateway.replica, formal: false}
+  - {method: POST, path: /v1/gateway/replica/poke, capability: gateway.replica, formal: false}
 uses:
   - {app: heain-database, capabilities: [db.account.read, db.account.write]}
+  - {app: heain-gateway, capabilities: [gateway.replica]}
 data_classes:
-  - {name: credential, sovereignty: node-local, encrypted_at_rest: true, crypto_shred: true}
-  - {name: session, sovereignty: node-local, encrypted_at_rest: true, retention: {max: 30d}}
+  - {name: credential, sovereignty: zone-local, encrypted_at_rest: true, crypto_shred: true}
+  - {name: session, sovereignty: zone-local, encrypted_at_rest: true, retention: {max: 30d}}
 offline:
-  allowed: [gateway.auth, gateway.proxy]
+  allowed: [gateway.auth, gateway.proxy, gateway.replica]
   journal: none

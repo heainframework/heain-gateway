@@ -10,3 +10,6 @@ companions: [../heain-database]
 endpoints:
   - {method: GET, path: /v1/gateway/routes, expect: 200}
   - {method: POST, path: /v1/gateway/sessions/revoke, body: {user: conformance-secret-user}, expect: 200, secret: conformance-secret-user}
+  # zone sync (Stage B-1c): only another heain-gateway may read the change log or ask for a pull
+  - {method: GET, path: /v1/gateway/replica/changes, expect: 403}
+  - {method: POST, path: /v1/gateway/replica/poke, expect: 403}
